@@ -47,6 +47,26 @@ type Client struct {
 	subscriptionByWSSubID   map[uint64]*Subscription
 	reconnectOnErr          bool
 	shortID                 bool
+
+	// Reconnection related fields
+	reconnectLock        sync.Mutex
+	isReconnecting       bool
+	reconnectAttempts    int
+	maxReconnectAttempts int
+	reconnectBackoff     time.Duration
+	httpHeader           http.Header
+	handshakeTimeout     time.Duration
+	activeSubscriptions  []*subscriptionInfo // Store subscription info for reconnection
+}
+
+// subscriptionInfo stores the information needed to recreate a subscription
+type subscriptionInfo struct {
+	params             []interface{}
+	conf               map[string]interface{}
+	subscriptionMethod string
+	unsubscribeMethod  string
+	decoderFunc        decoderFunc
+	subscription       *Subscription
 }
 
 const (
@@ -56,6 +76,10 @@ const (
 	pongWait = 60 * time.Second
 	// Send pings to peer with this period. Must be less than pongWait.
 	pingPeriod = (pongWait * 9) / 10
+	// Default reconnection settings
+	defaultMaxReconnectAttempts = 10
+	defaultReconnectBackoff     = 2 * time.Second
+	maxReconnectBackoff         = 30 * time.Second
 )
 
 // Connect creates a new websocket client connecting to the provided endpoint.
@@ -72,28 +96,45 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 		rpcURL:                  rpcEndpoint,
 		subscriptionByRequestID: map[uint64]*Subscription{},
 		subscriptionByWSSubID:   map[uint64]*Subscription{},
+		maxReconnectAttempts:    defaultMaxReconnectAttempts,
+		reconnectBackoff:        defaultReconnectBackoff,
+		activeSubscriptions:     []*subscriptionInfo{},
+		reconnectOnErr:          true,
 	}
 
+	// Store options for reconnection
+	if opt != nil {
+		c.shortID = opt.ShortID
+		c.reconnectOnErr = opt.ReconnectOnErr
+		c.httpHeader = opt.HttpHeader
+		c.handshakeTimeout = opt.HandshakeTimeout
+		if opt.MaxReconnectAttempts > 0 {
+			c.maxReconnectAttempts = opt.MaxReconnectAttempts
+		}
+	} else {
+		c.handshakeTimeout = DefaultHandshakeTimeout
+	}
+
+	// Establish initial connection
+	err = c.connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return c, nil
+}
+
+// connect establishes the WebSocket connection
+func (c *Client) connect(ctx context.Context) error {
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
-		HandshakeTimeout:  DefaultHandshakeTimeout,
+		HandshakeTimeout:  c.handshakeTimeout,
 		EnableCompression: true,
 	}
 
-	if opt != nil && opt.ShortID {
-		c.shortID = opt.ShortID
-	}
-
-	if opt != nil && opt.HandshakeTimeout > 0 {
-		dialer.HandshakeTimeout = opt.HandshakeTimeout
-	}
-
-	var httpHeader http.Header = nil
-	if opt != nil && opt.HttpHeader != nil && len(opt.HttpHeader) > 0 {
-		httpHeader = opt.HttpHeader
-	}
 	var resp *http.Response
-	c.conn, resp, err = dialer.DialContext(ctx, rpcEndpoint, httpHeader)
+	var err error
+	c.conn, resp, err = dialer.DialContext(ctx, c.rpcURL, c.httpHeader)
 	if err != nil {
 		if resp != nil {
 			body, _ := io.ReadAll(resp.Body)
@@ -101,14 +142,22 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 		} else {
 			err = fmt.Errorf("new ws client: dial: %w", err)
 		}
-		return nil, err
+		return err
 	}
 
 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
+
+	// Start ping/pong handler
 	go func() {
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		c.conn.SetPongHandler(func(string) error {
+			c.conn.SetReadDeadline(time.Now().Add(pongWait))
+			return nil
+		})
+
 		for {
 			select {
 			case <-c.connCtx.Done():
@@ -118,13 +167,141 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 			}
 		}
 	}()
+
+	// Start message receiver
 	go c.receiveMessages()
-	return c, nil
+
+	return nil
+}
+
+// reconnect attempts to reconnect to the WebSocket and restore subscriptions
+func (c *Client) reconnect() {
+	fmt.Println("Client reconnecting...")
+	c.reconnectLock.Lock()
+	if c.isReconnecting {
+		c.reconnectLock.Unlock()
+		return
+	}
+	c.isReconnecting = true
+	c.reconnectLock.Unlock()
+
+	defer func() {
+		c.reconnectLock.Lock()
+		c.isReconnecting = false
+		c.reconnectAttempts = 0
+		c.reconnectLock.Unlock()
+	}()
+
+	backoff := c.reconnectBackoff
+
+	for c.reconnectAttempts < c.maxReconnectAttempts {
+		c.reconnectAttempts++
+
+		zlog.Info("attempting to reconnect",
+			zap.Int("attempt", c.reconnectAttempts),
+			zap.Int("max_attempts", c.maxReconnectAttempts),
+		)
+
+		// Wait before reconnecting (except on first attempt)
+		if c.reconnectAttempts > 1 {
+			time.Sleep(backoff)
+			// Exponential backoff with max limit
+			backoff = backoff * 2
+			if backoff > maxReconnectBackoff {
+				backoff = maxReconnectBackoff
+			}
+		}
+
+		// Clean up old connection
+		if c.connCtxCancel != nil {
+			c.connCtxCancel()
+		}
+		if c.conn != nil {
+			c.conn.Close()
+		}
+
+		// Clear subscription maps (we'll restore them)
+		c.lock.Lock()
+		c.subscriptionByRequestID = map[uint64]*Subscription{}
+		c.subscriptionByWSSubID = map[uint64]*Subscription{}
+		c.lock.Unlock()
+
+		// Attempt to reconnect
+		ctx := context.Background()
+		err := c.connect(ctx)
+		if err != nil {
+			zlog.Error("reconnection failed",
+				zap.Error(err),
+				zap.Int("attempt", c.reconnectAttempts),
+			)
+			continue
+		}
+
+		// Restore subscriptions
+		err = c.restoreSubscriptions()
+		if err != nil {
+			zlog.Error("failed to restore subscriptions",
+				zap.Error(err),
+			)
+			continue
+		}
+
+		zlog.Info("successfully reconnected and restored subscriptions",
+			zap.Int("subscriptions_restored", len(c.activeSubscriptions)),
+		)
+		return
+	}
+
+	// Max attempts reached, close all subscriptions with error
+	c.closeAllSubscription(fmt.Errorf("failed to reconnect after %d attempts", c.maxReconnectAttempts))
+}
+
+// restoreSubscriptions re-subscribes all active subscriptions after reconnection
+func (c *Client) restoreSubscriptions() error {
+	c.lock.RLock()
+	subscriptions := make([]*subscriptionInfo, len(c.activeSubscriptions))
+	copy(subscriptions, c.activeSubscriptions)
+	c.lock.RUnlock()
+
+	for _, subInfo := range subscriptions {
+		// Create new request for the subscription
+		req := newRequest(subInfo.params, subInfo.subscriptionMethod, subInfo.conf, c.shortID)
+		data, err := req.encode()
+		if err != nil {
+			return fmt.Errorf("unable to encode subscription request: %w", err)
+		}
+
+		// Update the subscription with new request ID
+		subInfo.subscription.req = req
+
+		// Register the subscription with new request ID
+		c.lock.Lock()
+		c.subscriptionByRequestID[req.ID] = subInfo.subscription
+		c.lock.Unlock()
+
+		// Send the subscription request
+		c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		err = c.conn.WriteMessage(websocket.TextMessage, data)
+		if err != nil {
+			return fmt.Errorf("unable to send subscription request: %w", err)
+		}
+
+		zlog.Debug("restored subscription",
+			zap.Uint64("request_id", req.ID),
+			zap.String("method", subInfo.subscriptionMethod),
+		)
+	}
+
+	return nil
 }
 
 func (c *Client) sendPing() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+
+	if c.conn == nil {
+		return
+	}
 
 	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 	if err := c.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
@@ -135,8 +312,16 @@ func (c *Client) sendPing() {
 func (c *Client) Close() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.connCtxCancel()
-	c.conn.Close()
+
+	if c.connCtxCancel != nil {
+		c.connCtxCancel()
+	}
+	if c.conn != nil {
+		c.conn.Close()
+	}
+
+	// Clear all subscriptions
+	c.activeSubscriptions = []*subscriptionInfo{}
 }
 
 func (c *Client) receiveMessages() {
@@ -147,7 +332,18 @@ func (c *Client) receiveMessages() {
 		default:
 			_, message, err := c.conn.ReadMessage()
 			if err != nil {
-				c.closeAllSubscription(err)
+				zlog.Error("error reading message",
+					zap.Error(err),
+					zap.Bool("reconnect_enabled", c.reconnectOnErr),
+				)
+
+				// Check if we should attempt to reconnect
+				if c.reconnectOnErr {
+					// Don't close subscriptions yet, we'll try to reconnect
+					go c.reconnect()
+				} else {
+					c.closeAllSubscription(err)
+				}
 				return
 			}
 			c.handleMessage(message)
@@ -270,6 +466,7 @@ func (c *Client) closeAllSubscription(err error) {
 
 	c.subscriptionByRequestID = map[uint64]*Subscription{}
 	c.subscriptionByWSSubID = map[uint64]*Subscription{}
+	c.activeSubscriptions = []*subscriptionInfo{}
 }
 
 func (c *Client) closeSubscription(reqID uint64, err error) {
@@ -292,6 +489,14 @@ func (c *Client) closeSubscription(reqID uint64, err error) {
 
 	delete(c.subscriptionByRequestID, sub.req.ID)
 	delete(c.subscriptionByWSSubID, sub.subID)
+
+	// Remove from active subscriptions
+	for i, subInfo := range c.activeSubscriptions {
+		if subInfo.subscription == sub {
+			c.activeSubscriptions = append(c.activeSubscriptions[:i], c.activeSubscriptions[i+1:]...)
+			break
+		}
+	}
 }
 
 func (c *Client) unsubscribe(subID uint64, method string) error {
@@ -335,6 +540,18 @@ func (c *Client) subscribe(
 	)
 
 	c.subscriptionByRequestID[req.ID] = sub
+
+	// Store subscription info for potential reconnection
+	subInfo := &subscriptionInfo{
+		params:             params,
+		conf:               conf,
+		subscriptionMethod: subscriptionMethod,
+		unsubscribeMethod:  unsubscribeMethod,
+		decoderFunc:        decoderFunc,
+		subscription:       sub,
+	}
+	c.activeSubscriptions = append(c.activeSubscriptions, subInfo)
+
 	zlog.Info("added new subscription to websocket client", zap.Int("count", len(c.subscriptionByRequestID)))
 
 	zlog.Debug("writing data to conn", zap.String("data", string(data)))
@@ -342,6 +559,8 @@ func (c *Client) subscribe(
 	err = c.conn.WriteMessage(websocket.TextMessage, data)
 	if err != nil {
 		delete(c.subscriptionByRequestID, req.ID)
+		// Remove from active subscriptions
+		c.activeSubscriptions = c.activeSubscriptions[:len(c.activeSubscriptions)-1]
 		return nil, fmt.Errorf("unable to write request: %w", err)
 	}
 

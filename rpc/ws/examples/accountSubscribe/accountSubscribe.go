@@ -24,7 +24,8 @@ import (
 )
 
 func main() {
-	client, err := ws.Connect(context.Background(), rpc.MainNetBeta_WS)
+	url := rpc.MainNetBeta_WS
+	client, err := ws.Connect(context.Background(), url)
 	if err != nil {
 		panic(err)
 	}
@@ -34,7 +35,7 @@ func main() {
 	{
 		sub, err := client.AccountSubscribe(
 			program,
-			"",
+			rpc.CommitmentProcessed,
 		)
 		if err != nil {
 			panic(err)

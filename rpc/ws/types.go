@@ -69,10 +69,28 @@ type params struct {
 	Subscription int                 `json:"subscription"`
 }
 
+// Options represents configuration options for the WebSocket client
 type Options struct {
-	HttpHeader       http.Header
+	// HttpHeader contains optional HTTP headers to send during handshake
+	HttpHeader http.Header
+
+	// HandshakeTimeout specifies the timeout for completing the WebSocket handshake
 	HandshakeTimeout time.Duration
-	ShortID          bool // some RPC do not support int63/uint64 id, so need to enable it to rand a int31/uint32 id
+
+	// ShortID enables short ID mode for requests
+	ShortID bool
+
+	// ReconnectOnErr enables automatic reconnection when connection errors occur
+	ReconnectOnErr bool
+
+	// MaxReconnectAttempts specifies the maximum number of reconnection attempts
+	// Default is 10 if not specified
+	MaxReconnectAttempts int
+
+	// ReconnectBackoff specifies the initial backoff duration between reconnection attempts
+	// The backoff will double after each failed attempt up to a maximum of 30 seconds
+	// Default is 2 seconds if not specified
+	ReconnectBackoff time.Duration
 }
 
 var DefaultHandshakeTimeout = 45 * time.Second
