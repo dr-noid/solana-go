@@ -134,7 +134,7 @@ func (c *Client) connect(ctx context.Context) error {
 
 	var resp *http.Response
 	var err error
-	c.conn, resp, err = dialer.DialContext(ctx, c.rpcURL, c.httpHeader)
+	conn, resp, err := dialer.DialContext(ctx, c.rpcURL, c.httpHeader)
 	if err != nil {
 		if resp != nil {
 			body, _ := io.ReadAll(resp.Body)
@@ -145,22 +145,29 @@ func (c *Client) connect(ctx context.Context) error {
 		return err
 	}
 
-	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
+	connCtx, connCtxCancel := context.WithCancel(context.Background())
+
+	// Set connection and context atomically
+	c.lock.Lock()
+	c.conn = conn
+	c.connCtx = connCtx
+	c.connCtxCancel = connCtxCancel
+	c.lock.Unlock()
 
 	// Start ping/pong handler
 	go func() {
 		ticker := time.NewTicker(pingPeriod)
 		defer ticker.Stop()
 
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		c.conn.SetPongHandler(func(string) error {
-			c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(pongWait))
 			return nil
 		})
 
 		for {
 			select {
-			case <-c.connCtx.Done():
+			case <-connCtx.Done():
 				return
 			case <-ticker.C:
 				c.sendPing()
@@ -176,7 +183,6 @@ func (c *Client) connect(ctx context.Context) error {
 
 // reconnect attempts to reconnect to the WebSocket and restore subscriptions
 func (c *Client) reconnect() {
-	fmt.Println("Client reconnecting...")
 	c.reconnectLock.Lock()
 	if c.isReconnecting {
 		c.reconnectLock.Unlock()
@@ -212,16 +218,17 @@ func (c *Client) reconnect() {
 			}
 		}
 
-		// Clean up old connection
+		// Clean up old connection with proper locking
+		c.lock.Lock()
 		if c.connCtxCancel != nil {
 			c.connCtxCancel()
+			c.connCtxCancel = nil
 		}
 		if c.conn != nil {
 			c.conn.Close()
+			c.conn = nil
 		}
-
 		// Clear subscription maps (we'll restore them)
-		c.lock.Lock()
 		c.subscriptionByRequestID = map[uint64]*Subscription{}
 		c.subscriptionByWSSubID = map[uint64]*Subscription{}
 		c.lock.Unlock()
@@ -261,7 +268,12 @@ func (c *Client) restoreSubscriptions() error {
 	c.lock.RLock()
 	subscriptions := make([]*subscriptionInfo, len(c.activeSubscriptions))
 	copy(subscriptions, c.activeSubscriptions)
+	conn := c.conn
 	c.lock.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("connection is nil")
+	}
 
 	for _, subInfo := range subscriptions {
 		// Create new request for the subscription
@@ -280,8 +292,8 @@ func (c *Client) restoreSubscriptions() error {
 		c.lock.Unlock()
 
 		// Send the subscription request
-		c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-		err = c.conn.WriteMessage(websocket.TextMessage, data)
+		conn.SetWriteDeadline(time.Now().Add(writeWait))
+		err = conn.WriteMessage(websocket.TextMessage, data)
 		if err != nil {
 			return fmt.Errorf("unable to send subscription request: %w", err)
 		}
@@ -296,41 +308,52 @@ func (c *Client) restoreSubscriptions() error {
 }
 
 func (c *Client) sendPing() {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.lock.RLock()
+	conn := c.conn
+	c.lock.RUnlock()
 
-	if c.conn == nil {
+	if conn == nil {
 		return
 	}
 
-	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	if err := c.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+	conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
 		return
 	}
 }
 
 func (c *Client) Close() {
 	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	if c.connCtxCancel != nil {
 		c.connCtxCancel()
+		c.connCtxCancel = nil
 	}
 	if c.conn != nil {
 		c.conn.Close()
+		c.conn = nil
 	}
-
 	// Clear all subscriptions
 	c.activeSubscriptions = []*subscriptionInfo{}
+	c.lock.Unlock()
 }
 
 func (c *Client) receiveMessages() {
 	for {
+		// Get context safely
+		c.lock.RLock()
+		ctx := c.connCtx
+		conn := c.conn
+		c.lock.RUnlock()
+
+		if ctx == nil || conn == nil {
+			return
+		}
+
 		select {
-		case <-c.connCtx.Done():
+		case <-ctx.Done():
 			return
 		default:
-			_, message, err := c.conn.ReadMessage()
+			_, message, err := conn.ReadMessage()
 			if err != nil {
 				zlog.Error("error reading message",
 					zap.Error(err),
@@ -506,8 +529,16 @@ func (c *Client) unsubscribe(subID uint64, method string) error {
 		return fmt.Errorf("unable to encode unsubscription message for subID %d and method %s", subID, method)
 	}
 
-	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	err = c.conn.WriteMessage(websocket.TextMessage, data)
+	c.lock.RLock()
+	conn := c.conn
+	c.lock.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("connection is nil")
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(writeWait))
+	err = conn.WriteMessage(websocket.TextMessage, data)
 	if err != nil {
 		return fmt.Errorf("unable to send unsubscription message for subID %d and method %s", subID, method)
 	}
@@ -523,6 +554,10 @@ func (c *Client) subscribe(
 ) (*Subscription, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+
+	if c.conn == nil {
+		return nil, fmt.Errorf("connection is nil")
+	}
 
 	req := newRequest(params, subscriptionMethod, conf, c.shortID)
 	data, err := req.encode()
